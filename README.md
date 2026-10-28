@@ -1,5 +1,7 @@
 # nostd-sentinel
 
+[![tests](https://github.com/edgequantum65/nostd-sentinel/actions/workflows/tests.yml/badge.svg)](https://github.com/edgequantum65/nostd-sentinel/actions/workflows/tests.yml)
+
 **Integer-only, allocation-free anomaly detector for sensor streams on microcontrollers.**
 
 - `#![no_std]`, no heap, no floating point, no dependencies.
