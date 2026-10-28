@@ -1,0 +1,16 @@
+# Not published. Builds `Sentinel::<64>::observe` alone for a Cortex-M target so its
+# flash size can be read without a board. See `measure.sh`.
+[package]
+name = "sentinel-footprint"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+nostd-sentinel = { path = ".." }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+
+[workspace]
