@@ -1,0 +1,11 @@
+[package]
+name = "nostd-sentinel"
+version = "0.1.0"
+edition = "2021"
+description = "Integer-only, allocation-free anomaly detector for microcontrollers (no_std)."
+license = "MIT"
+authors = ["David Serreau — Edge Quantum 65"]
+keywords = ["no_std", "embedded", "anomaly", "sensor", "fixed-point"]
+categories = ["embedded", "no-std"]
+
+[dependencies]
