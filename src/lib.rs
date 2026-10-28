@@ -9,9 +9,10 @@
 //!   `(n*x - S)^2 * k_den^2 > k_num^2 * (n*Q - S^2)`.
 //! - Out-of-band samples are not added to the window, so a fault does not
 //!   teach the detector that faults are normal.
-//! - After `M` consecutive out-of-band samples (default `M = N`), the signal is
-//!   taken to have moved to a new level: the detector reports [`Verdict::Shift`],
-//!   clears its window and learns again from that sample.
+//! - After `M` consecutive out-of-band samples on the same side of the mean
+//!   (default `M = N`), the signal is taken to have moved to a new level: the
+//!   detector reports [`Verdict::Shift`], clears its window and learns again from
+//!   that sample.
 //!
 //! ```
 //! use nostd_sentinel::{Sentinel, Verdict};
@@ -139,13 +140,16 @@ pub enum Verdict {
     Normal,
     /// Out of band; the sample was not added to the window.
     Anomaly,
-    /// `M`-th out-of-band sample in a row: the window was cleared and warm-up
-    /// restarted from this sample, so the next `N - 1` verdicts are `Warmup`.
+    /// `M`-th out-of-band sample in a row on the same side of the mean: the window
+    /// was cleared and warm-up restarted from this sample, so the next `N - 1`
+    /// verdicts are `Warmup`. That warm-up judges nothing and learns whatever
+    /// arrives, spikes and a second level change included (no second `Shift`).
     Shift,
 }
 
 /// Anomaly detector over a window of `N` samples, `2 <= N <= MAX_WINDOW`
-/// (checked at compile time).
+/// (checked at compile time, when `new` is instantiated by `cargo build` or
+/// `cargo test`; `cargo check` and rust-analyzer do not report it).
 ///
 /// ```compile_fail
 /// let s = nostd_sentinel::Sentinel::<32_769>::new(4, 1, 2);
@@ -158,6 +162,7 @@ pub struct Sentinel<const N: usize> {
     min_dev: u32,
     relearn_after: usize,
     run: usize,
+    run_above: bool,
 }
 
 impl<const N: usize> Sentinel<N> {
@@ -177,14 +182,25 @@ impl<const N: usize> Sentinel<N> {
             min_dev,
             relearn_after: N,
             run: 0,
+            run_above: false,
         }
     }
 
-    /// Sets `M`: the `M`-th consecutive out-of-band sample is reported as
-    /// [`Verdict::Shift`] and the detector learns again from it. A burst shorter than
-    /// `M` is reported as `Anomaly` and never learned. `0` disables re-learning
-    /// (the 0.1 behaviour: a permanent level change is flagged forever).
+    /// Sets `M`: the `M`-th consecutive out-of-band sample on the same side of the
+    /// mean is reported as [`Verdict::Shift`] and the detector learns again from it.
+    /// A burst shorter than `M`, or one that keeps crossing the mean, is reported as
+    /// `Anomaly` and never learned. `0` disables re-learning (the 0.1 behaviour: a
+    /// permanent level change is flagged forever). `M = 1` is rejected: every
+    /// outlier would become a `Shift`, never an `Anomaly`.
+    ///
+    /// Trade-off: a fault lasting `M` samples or more on one side is learned as the
+    /// new normal. The `N - 1` samples after a `Shift` are not judged: if the fault
+    /// ends among them, the return to the old level is not reported either, and the
+    /// window then mixes both levels, so the detector is less sensitive until those
+    /// samples leave it. (A fault that outlasts that warm-up is judged on its return:
+    /// `Anomaly`, then `Shift` again.)
     pub const fn relearn_after(mut self, m: usize) -> Self {
+        assert!(m != 1, "relearn_after: use 0 (never) or m >= 2");
         self.relearn_after = m;
         self
     }
@@ -207,6 +223,13 @@ impl<const N: usize> Sentinel<N> {
             self.run = 0;
             self.window.push(x);
             return Verdict::Normal;
+        }
+        // Only a run on one side of the mean counts towards a shift (the mean does not
+        // move during a run, since out-of-band samples are not added).
+        let above = dev > 0;
+        if above != self.run_above {
+            self.run = 0;
+            self.run_above = above;
         }
         self.run = self.run.saturating_add(1);
         if self.run == self.relearn_after {

@@ -175,6 +175,116 @@ fn burst_of_exactly_m_triggers_shift() {
     assert_eq!(s.observe(5_000), Verdict::Normal);
 }
 
+/// Jitter in [-3, 3], used to fill a window.
+fn jitter(i: usize) -> i32 {
+    (i % 7) as i32 - 3
+}
+
+fn verdicts<const N: usize>(s: &mut Sentinel<N>, xs: &[i32]) -> Vec<Verdict> {
+    xs.iter().map(|&x| s.observe(x)).collect()
+}
+
+#[test]
+fn run_resets_on_normal() {
+    use Verdict::*;
+    let mut s = Sentinel::<8>::new(4, 1, 2).relearn_after(3);
+    for i in 0..8 {
+        s.observe(jitter(i));
+    }
+    let v = verdicts(&mut s, &[1000, 1000, 0, 1000, 1000, 0, 1000, 1000, 1000]);
+    assert_eq!(
+        v,
+        [Anomaly, Anomaly, Normal, Anomaly, Anomaly, Normal, Anomaly, Anomaly, Shift]
+    );
+}
+
+#[test]
+fn run_counts_one_side_of_the_mean_only() {
+    use Verdict::*;
+    let mut s = Sentinel::<8>::new(4, 1, 2).relearn_after(3);
+    for i in 0..8 {
+        s.observe(jitter(i));
+    }
+    let v = verdicts(&mut s, &[1000, 1000, -1000, -1000, -1000]);
+    assert_eq!(v, [Anomaly, Anomaly, Anomaly, Anomaly, Shift]);
+}
+
+#[test]
+fn window_after_shift_is_fresh_and_second_shift_works() {
+    let mut s = Sentinel::<8>::new(4, 1, 2);
+    for i in 0..8 {
+        s.observe(jitter(i));
+    }
+    for _ in 0..7 {
+        assert_eq!(s.observe(5_000), Verdict::Anomaly);
+    }
+    assert_eq!(s.observe(5_000), Verdict::Shift);
+    for _ in 0..7 {
+        assert_eq!(s.observe(5_000), Verdict::Warmup);
+    }
+    // Window is now 8 x 5 000 (zero variance): 3 units above it is out of band.
+    for _ in 0..7 {
+        assert_eq!(s.observe(5_003), Verdict::Anomaly);
+    }
+    assert_eq!(s.observe(5_003), Verdict::Shift);
+}
+
+/// Verdicts from index 100 on, for jitter with a +500 fault over `100..100 + len`.
+fn fault_trace(len: usize) -> Vec<Verdict> {
+    let mut s = Sentinel::<16>::new(4, 1, 2);
+    let xs: Vec<i32> = (0..400)
+        .map(|i| {
+            jitter(i)
+                + if (100..100 + len).contains(&i) {
+                    500
+                } else {
+                    0
+                }
+        })
+        .collect();
+    verdicts(&mut s, &xs).split_off(100)
+}
+
+/// `n` Anomaly, Shift, `n` Warmup (`N = M = 16` gives `n = 15`).
+fn shift_then_warmup() -> Vec<Verdict> {
+    let mut v = vec![Verdict::Anomaly; 15];
+    v.push(Verdict::Shift);
+    v.extend(vec![Verdict::Warmup; 15]);
+    v
+}
+
+#[test]
+fn fault_of_m_or_more_is_learned() {
+    // Ends during the warm-up after the Shift: the return is learned, not reported.
+    let mut expected = shift_then_warmup();
+    expected.extend(vec![Verdict::Normal; 300 - 31]);
+    assert_eq!(fault_trace(20), expected);
+    // Outlasts the warm-up: the return is judged, and is a level shift of its own.
+    let mut expected = shift_then_warmup();
+    expected.extend(vec![Verdict::Normal; 100 - 31]);
+    expected.extend(shift_then_warmup());
+    expected.extend(vec![Verdict::Normal; 200 - 31]);
+    assert_eq!(fault_trace(100), expected);
+}
+
+#[test]
+fn fault_alternating_around_the_mean_never_shifts() {
+    let mut s = Sentinel::<16>::new(4, 1, 2);
+    for i in 0..16 {
+        assert_eq!(s.observe(jitter(i)), Verdict::Warmup);
+    }
+    for i in 0..10_000 {
+        let x = if i % 2 == 0 { 100_000 } else { -100_000 };
+        assert_eq!(s.observe(x), Verdict::Anomaly);
+    }
+}
+
+#[test]
+#[should_panic]
+fn relearn_after_one_is_rejected() {
+    let _ = Sentinel::<8>::new(4, 1, 2).relearn_after(1);
+}
+
 /// Fresh detector, window filled with `fill`, then judges `x`.
 fn judge<F: Fn(usize) -> i32, const N: usize>(
     k_num: u16,
@@ -236,24 +346,41 @@ fn reference(window: &[i32], x: i32, k_num: u16, k_den: u16, min_dev: u32) -> Op
     Some(dev > thr && dev > floor)
 }
 
-/// Random windows and samples at several scales; returns (anomalies, normals, skipped).
-fn cross_check<const N: usize>(rng: &mut Lcg, cases: usize) -> (usize, usize, usize) {
+/// Totals of a cross-check run.
+#[derive(Debug, Default)]
+struct Tally {
+    anomalies: usize,
+    normals: usize,
+    /// Cases stopped at a sample within `f64` tolerance of a boundary.
+    stopped: usize,
+}
+
+/// Random streams at several scales: `N` warm-up samples, `0..=2N` more samples drawn
+/// the same way (so the window slides and old values are subtracted), then one sample
+/// anywhere. Every judged sample is compared with the `f64` reference.
+fn cross_check<const N: usize>(rng: &mut Lcg, cases: usize, tally: &mut Tally) {
     let clamp = |v: i64| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-    let (mut anomalies, mut normals, mut skipped) = (0, 0, 0);
-    let mut window = [0i32; N];
     for _ in 0..cases {
         let scale: i64 = [3, 1_000, 1 << 20, 1 << 31][rng.below(4) as usize];
         let base = rng.next_u32() as i32 as i64 / 2;
         let constant = rng.below(20) == 0;
-        for (i, v) in window.iter_mut().enumerate() {
+        // A constant window only gets the final sample: more samples equal to the
+        // mean would sit exactly on the boundary (|x - mean| = k * std = 0).
+        let len = if constant {
+            N
+        } else {
+            N + rng.below(2 * N as u64 + 1) as usize
+        };
+        let mut stream = Vec::with_capacity(len + 1);
+        for i in 0..len {
             let noise = if constant && i > 0 {
                 0
             } else {
                 rng.below(2 * scale as u64 + 1) as i64 - scale
             };
-            *v = clamp(base + noise);
+            stream.push(clamp(base + noise));
         }
-        let x = if rng.below(4) == 0 {
+        stream.push(if rng.below(4) == 0 {
             rng.next_u32() as i32
         } else {
             let step = rng.below(9 * scale as u64 + 1) as i64;
@@ -262,7 +389,7 @@ fn cross_check<const N: usize>(rng: &mut Lcg, cases: usize) -> (usize, usize, us
             } else {
                 base + step
             })
-        };
+        });
         let k_den = [1, 2, 3, 10, 100, u16::MAX, 1 + rng.below(65_535) as u16];
         let k_den = k_den[rng.below(7) as usize];
         let k_num = rng.below((6 * k_den as u64 + 1).min(65_536)) as u16;
@@ -273,67 +400,71 @@ fn cross_check<const N: usize>(rng: &mut Lcg, cases: usize) -> (usize, usize, us
         };
 
         let mut s = Sentinel::<N>::new(k_num, k_den, min_dev).relearn_after(0);
-        for &v in &window {
-            assert_eq!(s.observe(v), Verdict::Warmup);
-        }
-        let got = s.observe(x);
-        let expected = match reference(&window, x, k_num, k_den, min_dev) {
-            None => {
-                skipped += 1;
+        let mut window: Vec<i32> = Vec::with_capacity(N);
+        for &x in &stream {
+            let got = s.observe(x);
+            if window.len() < N {
+                assert_eq!(got, Verdict::Warmup);
+                window.push(x);
                 continue;
             }
-            Some(true) => {
-                anomalies += 1;
-                Verdict::Anomaly
-            }
-            Some(false) => {
-                normals += 1;
-                Verdict::Normal
-            }
-        };
-        assert_eq!(
-            got, expected,
-            "window {:?} x {} k {}/{} floor {}",
-            window, x, k_num, k_den, min_dev
-        );
+            let expected = match reference(&window, x, k_num, k_den, min_dev) {
+                None => {
+                    tally.stopped += 1;
+                    break;
+                }
+                Some(true) => {
+                    tally.anomalies += 1;
+                    Verdict::Anomaly
+                }
+                Some(false) => {
+                    tally.normals += 1;
+                    window.remove(0);
+                    window.push(x);
+                    Verdict::Normal
+                }
+            };
+            assert_eq!(
+                got, expected,
+                "window {:?} x {} k {}/{} floor {}",
+                window, x, k_num, k_den, min_dev
+            );
+        }
     }
-    (anomalies, normals, skipped)
 }
 
 #[test]
 fn randomized_cross_check_against_f64_reference() {
     let mut rng = Lcg(20_261_028);
-    let mut total = (0, 0, 0);
-    for (a, n, s) in [
-        cross_check::<2>(&mut rng, 5_000),
-        cross_check::<3>(&mut rng, 5_000),
-        cross_check::<16>(&mut rng, 5_000),
-        cross_check::<64>(&mut rng, 5_000),
-        cross_check::<257>(&mut rng, 5_000),
-    ] {
-        total = (total.0 + a, total.1 + n, total.2 + s);
-    }
-    let (anomalies, normals, skipped) = total;
+    let mut t = Tally::default();
+    cross_check::<2>(&mut rng, 5_000, &mut t);
+    cross_check::<3>(&mut rng, 5_000, &mut t);
+    cross_check::<16>(&mut rng, 5_000, &mut t);
+    cross_check::<64>(&mut rng, 5_000, &mut t);
+    cross_check::<257>(&mut rng, 5_000, &mut t);
     println!(
-        "cross-check: {} anomalies, {} normals, {} skipped near a boundary",
-        anomalies, normals, skipped
+        "cross-check: 25000 streams, {} judged samples agree ({} anomalies, {} normals), \
+         {} streams stopped near a boundary",
+        t.anomalies + t.normals,
+        t.anomalies,
+        t.normals,
+        t.stopped
     );
-    assert_eq!(anomalies + normals + skipped, 25_000);
-    assert!(anomalies > 2_500 && normals > 2_500, "{:?}", total);
-    assert!(skipped < 250, "{:?}", total);
+    assert!(t.anomalies > 10_000 && t.normals > 100_000, "{:?}", t);
+    assert!(t.stopped < 2_500, "{:?}", t);
 }
 
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn ram_footprint_is_known() {
     // Computed by the compiler for this host (x86_64), not measured on a board.
-    // i128 is 16-byte aligned on x86_64 since Rust 1.77 (8-byte before): 336 vs 320.
+    // i128 is 16-byte aligned on x86_64 since Rust 1.77 (8-byte before): 336 vs 328.
     let size = core::mem::size_of::<Sentinel<64>>();
     println!("size_of::<Sentinel<64>>() = {}", size);
     let expected = if core::mem::align_of::<i128>() == 16 {
         336
     } else {
-        320
+        328
     };
     assert_eq!(size, expected);
 }

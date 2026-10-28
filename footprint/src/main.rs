@@ -7,7 +7,7 @@ use core::mem::size_of;
 use nostd_sentinel::Sentinel;
 
 // RAM: computed by the compiler for this target, checked at build time.
-const _: () = assert!(size_of::<Sentinel<64>>() == 304);
+const _: () = assert!(size_of::<Sentinel<64>>() == 312);
 
 #[no_mangle]
 pub extern "C" fn sentinel64_observe(s: &mut Sentinel<64>, x: i32) -> u8 {
